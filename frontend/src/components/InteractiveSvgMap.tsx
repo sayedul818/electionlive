@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type InteractiveSvgMapProps = {
   src: string;
   idMap?: Record<string, string>;
+  labelFillMap?: Record<string, string>;
   selectedId?: string | null;
   onSelect?: (value: string) => void;
   interactivePaths?: boolean;
@@ -19,6 +20,7 @@ type InteractiveSvgMapProps = {
 export default function InteractiveSvgMap({
   src,
   idMap,
+  labelFillMap,
   selectedId,
   onSelect,
   interactivePaths = false,
@@ -46,11 +48,37 @@ export default function InteractiveSvgMap({
       .then((response) => response.text())
       .then((text) => {
         if (!mounted) return;
-        const normalized = text
+        const legendNames = [
+          "Awami League",
+          "Islami Jatiya Oikya Front",
+          "Bangladesh Nationalist Party",
+          "Islami Oikya Jote",
+          "Bangladesh Jatiya Party",
+          "Bangladesh Jamaat-e-Islami",
+          "Krishak Sramik Janata League",
+          "Jatiya Party (Manju)",
+        ];
+        const normalized = legendNames.reduce((acc, name) => {
+          const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const regex = new RegExp(`<text[^>]*>\\s*${escaped}\\s*<\\/text>`, "gi");
+          return acc.replace(regex, "");
+        }, text)
+          .replace(/<g[^>]*transform="matrix\(0\.537047[^\"]*\)"[^>]*>[\s\S]*?<\/g>/gi, "")
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
           .replace(/\swidth="[^"]*"/i, "")
           .replace(/\sheight="[^"]*"/i, "")
           .replace(/\swidth='[^']*'/i, "")
           .replace(/\sheight='[^']*'/i, "")
+          .replace(/\sstyle="[^"]*"/gi, "")
+          .replace(/\sstyle='[^']*'/gi, "")
+          .replace(/\sclass="[^"]*"/gi, "")
+          .replace(/\sclass='[^']*'/gi, "")
+          .replace(/\sfill="[^"]*"/gi, "")
+          .replace(/\sfill='[^']*'/gi, "")
+          .replace(/\sstroke="[^"]*"/gi, "")
+          .replace(/\sstroke='[^']*'/gi, "")
+          .replace(/\sstroke-width="[^"]*"/gi, "")
+          .replace(/\sstroke-width='[^']*'/gi, "")
           .replace(
             /<svg\b/i,
             '<svg width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="width:100%;height:100%;max-width:100%;max-height:100%;display:block;"'
@@ -142,19 +170,37 @@ export default function InteractiveSvgMap({
       };
 
       const applyFill = (shape: SVGGraphicsElement, fill: string) => {
+        shape.style.fill = fill;
         shape.setAttribute("fill", fill);
       };
 
       const restoreFill = (shape: SVGGraphicsElement) => {
         const original = shape.dataset.originalFill ?? "";
         if (original) {
+          shape.style.removeProperty("fill");
           shape.setAttribute("fill", original);
         } else {
+          shape.style.removeProperty("fill");
           shape.removeAttribute("fill");
         }
       };
 
-      const allShapes = Array.from(svg.querySelectorAll(shapeSelector)) as SVGGraphicsElement[];
+      const shapesRoot = (svg.querySelector("#Wahlkreise") as SVGElement | null) ?? svg;
+      const allShapes = Array.from(shapesRoot.querySelectorAll(shapeSelector)) as SVGGraphicsElement[];
+      const allShapesInSvg = Array.from(svg.querySelectorAll(shapeSelector)) as SVGGraphicsElement[];
+      if (baseFill) {
+        allShapesInSvg.forEach((shape) => {
+          shape.style.fill = baseFill;
+          shape.setAttribute("fill", baseFill);
+        });
+      }
+
+      const getSeatFill = (shape: SVGGraphicsElement) => {
+        if (!labelFillMap) return undefined;
+        const seatLabel = findNearestLabel(shape);
+        if (!seatLabel) return undefined;
+        return labelFillMap[seatLabel];
+      };
       allShapes.forEach((shape, index) => {
         rememberOriginalFill(shape);
         shape.dataset.pathId = shape.dataset.pathId ?? `shape-${index}`;
@@ -169,10 +215,15 @@ export default function InteractiveSvgMap({
             : "none";
         if (selectedPathId === shape.dataset.pathId) {
           applyFill(shape, activeFill);
-        } else if (baseFill) {
-          applyFill(shape, baseFill);
         } else {
-          restoreFill(shape);
+          const seatFill = getSeatFill(shape);
+          if (seatFill) {
+            applyFill(shape, seatFill);
+          } else if (baseFill) {
+            applyFill(shape, baseFill);
+          } else {
+            restoreFill(shape);
+          }
         }
       });
 
@@ -190,10 +241,15 @@ export default function InteractiveSvgMap({
               : "none";
           if (selectedPathId === previous.dataset.pathId) {
             applyFill(previous, activeFill);
-          } else if (baseFill) {
-            applyFill(previous, baseFill);
           } else {
-            restoreFill(previous);
+            const seatFill = getSeatFill(previous);
+            if (seatFill) {
+              applyFill(previous, seatFill);
+            } else if (baseFill) {
+              applyFill(previous, baseFill);
+            } else {
+              restoreFill(previous);
+            }
           }
         }
         shape.style.opacity = "1";
@@ -221,10 +277,15 @@ export default function InteractiveSvgMap({
             : "none";
         if (selectedPathId === shape.dataset.pathId) {
           applyFill(shape, activeFill);
-        } else if (baseFill) {
-          applyFill(shape, baseFill);
         } else {
-          restoreFill(shape);
+          const seatFill = getSeatFill(shape);
+          if (seatFill) {
+            applyFill(shape, seatFill);
+          } else if (baseFill) {
+            applyFill(shape, baseFill);
+          } else {
+            restoreFill(shape);
+          }
         }
         if (hoveredPathRef.current === (shape as unknown as SVGPathElement)) hoveredPathRef.current = null;
         if (onHoverPath) {
@@ -361,6 +422,8 @@ export default function InteractiveSvgMap({
     onHoverLabel,
     hoverFill,
     activeFill,
+    labelFillMap,
+    baseFill,
   ]);
 
   return (

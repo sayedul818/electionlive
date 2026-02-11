@@ -6,6 +6,7 @@ export type SeatLeader = {
   leaderName: string;
   votes: number;
   margin: number;
+  partyColor?: string;
 };
 
 type SeatGridProps = {
@@ -49,7 +50,7 @@ export default function SeatGrid({
               className={`h-3 w-full rounded-sm border ${
                 isSelected ? "border-white" : "border-transparent"
               } transition hover:brightness-110 focus:outline-none focus-visible:ring-1 focus-visible:ring-white/70 focus-visible:ring-inset`}
-              style={{ backgroundColor: party?.color ?? neutralColor }}
+              style={{ backgroundColor: leader?.partyColor ?? party?.color ?? neutralColor }}
             />
           );
         })}

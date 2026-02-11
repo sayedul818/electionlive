@@ -36,6 +36,7 @@ export type Candidate = {
   imageUrl?: string;
   partyLabel?: string;
   symbolLabel?: string;
+  symbolImageUrl?: string;
 };
 
 export type Voter = {

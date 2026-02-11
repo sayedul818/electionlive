@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { onAuthStateChanged, signInWithPopup, type User } from "firebase/auth";
 import { scaleLinear } from "d3";
 import { auth, googleProvider } from "./firebase";
 import SeatGrid, { type SeatLeader } from "./components/SeatGrid";
+import SeatCandidatesPage, { getPartyLogoForLabel, normalizePartyText } from "./components/SeatCandidatesPage";
 import StatsBar from "./components/StatsBar";
 import InteractiveSvgMap from "./components/InteractiveSvgMap";
 import {
@@ -120,6 +122,13 @@ const normalizeCandidateImage = (url?: string) => {
   return url
     .replace(/&amp;/g, "&")
     .replace(/^http:\/\/103\.183\.38\.66/, "/api");
+};
+const normalizeSymbolImage = (url?: string) => {
+  if (!url) return undefined;
+  return url
+    .replace(/&amp;/g, "&")
+    .replace(/^http:\/\/103\.183\.38\.66/, "/api")
+    .replace(/^https:\/\/103\.183\.38\.66/, "/api");
 };
 
 const votedGoogleUidsKey = "votedGoogleUids";
@@ -262,6 +271,25 @@ function App() {
   const [partyRoster, setPartyRoster] = useState<PartyInfo[]>(parties);
   const [partyModal, setPartyModal] = useState<PartyModalState>({ open: false });
   const [mobileView, setMobileView] = useState<"results" | "vote">("results");
+  const [activePage, setActivePage] = useState<"dashboard" | "seat" | "admin">("dashboard");
+  const [adminDivisionId, setAdminDivisionId] = useState<string | null>(null);
+  const [adminDistrictId, setAdminDistrictId] = useState<string | null>(null);
+  const [adminSeatId, setAdminSeatId] = useState<number | null>(null);
+  const [adminCandidates, setAdminCandidates] = useState<Candidate[]>([]);
+  const [adminUiSeats, setAdminUiSeats] = useState<Seat[]>(seedSeats);
+  const [adminVoteInputs, setAdminVoteInputs] = useState<Record<string, number>>({});
+  const [adminVoteModal, setAdminVoteModal] = useState<{ open: boolean; candidateId: string | null; value: number }>(
+    { open: false, candidateId: null, value: 0 }
+  );
+  const [adminVoteSaving, setAdminVoteSaving] = useState(false);
+  const [seatWinners, setSeatWinners] = useState<Array<{
+    seatId: number;
+    candidateName: string | null;
+    partyLabel?: string | null;
+    votes: number;
+  }>>([]);
+  const location = useLocation();
+  const navigate = useNavigate();
   const [selectedLiveMapPathId, setSelectedLiveMapPathId] = useState<string | null>(null);
   const [voteModal, setVoteModal] = useState<VoteModalState>({ open: false, candidateId: null });
   const [formError, setFormError] = useState<string | null>(null);
@@ -273,8 +301,40 @@ function App() {
   const [liveUpdate, setLiveUpdate] = useState("Waiting for votes...");
 
   const partyLookup = useMemo(() => new Map<string, Party>(parties.map((party) => [party.id, party])), []);
+  const apiBase = (import.meta as { env?: Record<string, string> }).env?.VITE_API_BASE ?? "http://localhost:5000/api";
   const seatGrid = useMemo(() => buildSeatGrid(seats), [seats]);
   const leaders = useMemo(() => buildSeatLeaders(candidates), [candidates]);
+  const partyRosterLookup = useMemo(
+    () => new Map(partyRoster.map((party) => [party.name, party.color])),
+    [partyRoster]
+  );
+  const getWinnerColor = useCallback(
+    (label?: string | null) => {
+      if (!label) return undefined;
+      const exact = partyRosterLookup.get(label);
+      if (exact) return exact;
+      const normalized = label.toLowerCase();
+      const hash = Array.from(normalized).reduce((acc, char) => acc + char.charCodeAt(0), 0);
+      return partyPalette[hash % partyPalette.length];
+    },
+    [partyRosterLookup]
+  );
+  const leadersForMap = useMemo(() => {
+    if (seatWinners.length === 0) return leaders;
+    const next = new Map(leaders);
+    seatWinners.forEach((winner) => {
+      const partyColor = getWinnerColor(winner.partyLabel);
+      next.set(winner.seatId, {
+        seatId: winner.seatId,
+        partyId: winner.partyLabel ?? "NEUTRAL",
+        leaderName: winner.candidateName ?? "No winner",
+        votes: winner.votes ?? 0,
+        margin: 0,
+        ...(partyColor ? { partyColor } : {}),
+      } as SeatLeader & { partyColor?: string });
+    });
+    return next;
+  }, [leaders, seatWinners, partyRosterLookup]);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
@@ -290,8 +350,58 @@ function App() {
     return () => unsubscribe();
   }, []);
 
+  useEffect(() => {
+    const isAdminPath = location.pathname.startsWith("/admin");
+    if (isAdminPath) {
+      setActivePage("admin");
+      return;
+    }
+    if (activePage === "admin") {
+      setActivePage("dashboard");
+    }
+  }, [location.pathname, activePage]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const loadSeatWinners = async () => {
+      try {
+        const response = await fetch(`${apiBase}/seats/winners`, { signal: controller.signal });
+        if (!response.ok) return;
+        const data = (await response.json()) as Array<{
+          seatId: number;
+          candidateName: string | null;
+          partyLabel?: string | null;
+          votes: number;
+        }>;
+        setSeatWinners(data);
+      } catch {
+        // ignore
+      }
+    };
+    loadSeatWinners();
+    const interval = setInterval(loadSeatWinners, 8000);
+    return () => {
+      controller.abort();
+      clearInterval(interval);
+    };
+  }, [apiBase]);
+
   const stats = useMemo(() => {
     const counts = new Map<string, number>();
+    if (seatWinners.length > 0) {
+      seatWinners.forEach((winner) => {
+        if (!winner.partyLabel) return;
+        counts.set(winner.partyLabel, (counts.get(winner.partyLabel) ?? 0) + 1);
+      });
+      return partyRoster.map((party) => {
+        const seatsWon = counts.get(party.name) ?? 0;
+        return {
+          partyId: party.id,
+          seats: seatsWon,
+          percent: Math.round((seatsWon / totalSeats) * 100),
+        };
+      });
+    }
     leaders.forEach((leader) => {
       if (leader.partyId === "NEUTRAL") return;
       counts.set(leader.partyId, (counts.get(leader.partyId) ?? 0) + 1);
@@ -304,13 +414,67 @@ function App() {
         percent: Math.round((seatsWon / totalSeats) * 100),
       };
     });
-  }, [leaders, partyRoster]);
+  }, [leaders, partyRoster, seatWinners]);
   const snapshotRoster = partyRoster.length > 0 ? partyRoster : parties;
+
+  const mapLabelFill = useMemo(() => {
+    const next: Record<string, string> = {};
+    leadersForMap.forEach((leader, seatId) => {
+      const color = (leader as SeatLeader & { partyColor?: string }).partyColor ?? getWinnerColor(leader.partyId);
+      if (color) next[String(seatId)] = color;
+    });
+    return next;
+  }, [leadersForMap, getWinnerColor]);
+
+  const topPartyLegend = useMemo(() => {
+    const rosterById = new Map(snapshotRoster.map((party) => [party.id, party]));
+    const preferredGroups = [
+      { key: "ncp", variants: ["ncp", "এনসিপি", "জাতীয়নাগরিকপার্টি", "জাতীয়নাগরিকপার্টি"] },
+      { key: "jamaat", variants: ["jamaat", "জামায়াত", "জামায়াত", "জামাতে", "জামায়াতে"] },
+      { key: "bnp", variants: ["bnp", "বিএনপি", "বাংলাদেশজাতীয়তাবাদীদল", "বাংলাদেশজাতীয়তাবাদীদল"] },
+      { key: "iab", variants: ["iab", "ইসলামিআন্দোলনবাংলাদেশ", "ইসলামিআন্দোলন"] },
+    ];
+
+    const normalizedRoster = snapshotRoster.map((party) => ({
+      party,
+      normalized: normalizePartyText(party.name),
+    }));
+
+    const preferred = preferredGroups
+      .map((group) => {
+        const match = normalizedRoster.find((entry) =>
+          group.variants.some((variant) => {
+            const normalizedVariant = normalizePartyText(variant);
+            return entry.normalized.includes(normalizedVariant) || normalizedVariant.includes(entry.normalized);
+          })
+        );
+        return match?.party ?? null;
+      })
+      .filter((party): party is PartyInfo => Boolean(party));
+
+    if (preferred.length > 0) {
+      return preferred.map((party) => ({
+        partyId: party.id,
+        seats: stats.find((stat) => stat.partyId === party.id)?.seats ?? 0,
+        percent: stats.find((stat) => stat.partyId === party.id)?.percent ?? 0,
+        party,
+      }));
+    }
+
+    return stats
+      .map((stat) => ({
+        ...stat,
+        party: rosterById.get(stat.partyId),
+      }))
+      .filter((item): item is { partyId: string; seats: number; percent: number; party: PartyInfo } => Boolean(item.party))
+      .sort((a, b) => b.seats - a.seats)
+      .slice(0, 5);
+  }, [stats, snapshotRoster]);
 
   const isLiveData = districtsLive.length > 0;
   const seatSourceForDetails = isLiveData ? uiSeats : seats;
   const selectedSeat = seatSourceForDetails.find((seat) => seat.id === selectedSeatId) ?? null;
-  const hoveredSeat = seats.find((seat) => seat.id === hoveredSeatId) ?? null;
+  const hoveredSeat = seatGrid.find((seat) => seat.id === hoveredSeatId) ?? null;
   const candidatesInSeat = useMemo(() => {
     if (!selectedSeatId) return [];
     return candidates
@@ -318,10 +482,14 @@ function App() {
       .sort((a, b) => b.votes - a.votes);
   }, [candidates, selectedSeatId]);
 
-  const hoveredLeader = hoveredSeatId ? leaders.get(hoveredSeatId) : undefined;
-  const hoveredParty = hoveredLeader?.partyId && hoveredLeader.partyId !== "NEUTRAL"
-    ? partyLookup.get(hoveredLeader.partyId)
-    : undefined;
+  const hoveredLeader = hoveredSeatId ? leadersForMap.get(hoveredSeatId) : undefined;
+  const hoveredPartyLabel =
+    hoveredLeader?.partyId && hoveredLeader.partyId !== "NEUTRAL"
+      ? String(hoveredLeader.partyId)
+      : undefined;
+  const hoveredPartyColor = hoveredLeader?.partyColor
+    ?? (hoveredPartyLabel ? partyRosterLookup.get(hoveredPartyLabel) : undefined)
+    ?? (hoveredLeader?.partyId ? partyLookup.get(hoveredLeader.partyId)?.color : undefined);
 
   const totalVotesInSeat = candidatesInSeat.reduce((acc, candidate) => acc + candidate.votes, 0);
   const turnoutPercent = selectedSeat
@@ -531,8 +699,79 @@ function App() {
   }, [selectedDistrictId, isLiveData, selectedDivisionId]);
 
   useEffect(() => {
+    if (!adminDistrictId || !isLiveData) {
+      setAdminUiSeats(seedSeats);
+      return;
+    }
+    const controller = new AbortController();
+    const loadAdminConstituencies = async () => {
+      try {
+        const response = await fetch(
+          `/api/election/get-setting-constituency?zillaID=${adminDistrictId}&electionID=478`,
+          { signal: controller.signal }
+        );
+        const json = await response.json();
+        if (!json?.constituencies) return;
+        const mapped: Seat[] = json.constituencies.map(
+          (constituency: { constituencyID: string; constituency_name: string }) => ({
+            id: Number(constituency.constituencyID),
+            divisionId: adminDivisionId ?? "all",
+            districtId: adminDistrictId,
+            name: constituency.constituency_name,
+            totalVoters: 150000,
+          })
+        );
+        setAdminUiSeats(mapped);
+      } catch {
+        setAdminUiSeats(seedSeats);
+      }
+    };
+    loadAdminConstituencies();
+    return () => controller.abort();
+  }, [adminDistrictId, adminDivisionId, isLiveData]);
+
+  useEffect(() => {
     if (!selectedSeatId || !selectedDistrictId || !isLiveData) return;
     const controller = new AbortController();
+    const parseCandidatesFromHtml = (text: string, seatId: number): Candidate[] => {
+      const rawHtml = text.trim().startsWith("\"") ? JSON.parse(text) : text;
+      const sanitizedHtml = rawHtml.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+      const decodedHtml = sanitizedHtml.includes("\\u003c")
+        ? sanitizedHtml
+            .replace(/\\u003c/g, "<")
+            .replace(/\\u003e/g, ">")
+            .replace(/\\u0026amp;/g, "&amp;")
+            .replace(/\\n/g, "\n")
+            .replace(/\\t/g, "\t")
+        : sanitizedHtml;
+      const wrappedHtml = `<table>${decodedHtml}</table>`;
+      const doc = new DOMParser().parseFromString(wrappedHtml, "text/html");
+      const rows = Array.from(doc.querySelectorAll("tr"));
+      return rows
+        .map((row, index) => {
+          const cells = row.querySelectorAll("td");
+          const name = cells[0]?.textContent?.trim();
+          if (!name) return null;
+          const imageUrl = cells[1]?.querySelector("img")?.getAttribute("src") ?? undefined;
+          const partyLabel = cells[2]?.textContent?.trim() ?? "Independent";
+          const symbolCell = cells[3];
+          const symbolLabel = symbolCell?.textContent?.trim() ?? "";
+          const symbolImageUrl = symbolCell?.querySelector("img")?.getAttribute("src") ?? undefined;
+          return {
+            id: `live-${seatId}-${index}`,
+            name,
+            partyId: "IND",
+            seatId: Number(seatId),
+            symbol: symbolLabel || "—",
+            votes: 0,
+            imageUrl,
+            partyLabel,
+            symbolLabel,
+            symbolImageUrl,
+          } as Candidate;
+        })
+        .filter((item): item is Candidate => Boolean(item));
+    };
     const loadCandidates = async () => {
       try {
         const response = await fetch(
@@ -540,40 +779,7 @@ function App() {
           { signal: controller.signal, credentials: "include" }
         );
         const text = await response.text();
-        const rawHtml = text.trim().startsWith("\"") ? JSON.parse(text) : text;
-        const sanitizedHtml = rawHtml.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
-        const decodedHtml = sanitizedHtml.includes("\\u003c")
-          ? sanitizedHtml
-              .replace(/\\u003c/g, "<")
-              .replace(/\\u003e/g, ">")
-              .replace(/\\u0026amp;/g, "&amp;")
-              .replace(/\\n/g, "\n")
-              .replace(/\\t/g, "\t")
-          : sanitizedHtml;
-        const wrappedHtml = `<table>${decodedHtml}</table>`;
-        const doc = new DOMParser().parseFromString(wrappedHtml, "text/html");
-        const rows = Array.from(doc.querySelectorAll("tr"));
-        const parsed: Candidate[] = rows
-          .map((row, index) => {
-            const cells = row.querySelectorAll("td");
-            const name = cells[0]?.textContent?.trim();
-            if (!name) return null;
-            const imageUrl = cells[1]?.querySelector("img")?.getAttribute("src") ?? undefined;
-            const partyLabel = cells[2]?.textContent?.trim() ?? "Independent";
-            const symbolLabel = cells[3]?.textContent?.trim() ?? "";
-            return {
-              id: `live-${selectedSeatId}-${index}`,
-              name,
-              partyId: "IND",
-              seatId: Number(selectedSeatId),
-              symbol: symbolLabel || "—",
-              votes: 0,
-              imageUrl,
-              partyLabel,
-              symbolLabel,
-            } as Candidate;
-          })
-          .filter((item): item is Candidate => Boolean(item));
+        const parsed = parseCandidatesFromHtml(text, selectedSeatId);
         if (parsed.length > 0) {
           setCandidates(parsed);
           setLiveUpdate(`Live candidate list loaded (${parsed.length}).`);
@@ -590,15 +796,80 @@ function App() {
     return () => controller.abort();
   }, [selectedSeatId, selectedDistrictId, isLiveData]);
 
+  useEffect(() => {
+    if (!adminSeatId || !adminDistrictId) {
+      setAdminCandidates([]);
+      setAdminVoteInputs({});
+      return;
+    }
+    const controller = new AbortController();
+    const loadAdminCandidates = async () => {
+      try {
+        const response = await fetch(`${apiBase}/seats/${adminSeatId}/candidates`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error("Failed to load candidates");
+        const parsed = (await response.json()) as Candidate[];
+        const normalized = parsed.map((candidate) => ({
+          ...candidate,
+          id: (candidate as { _id?: string })._id ?? candidate.id,
+        }));
+        if (normalized.length === 0) {
+          await fetch(`${apiBase}/seats/${adminSeatId}/candidates/sync?zillaId=${adminDistrictId}`, {
+            method: "POST",
+            signal: controller.signal,
+          });
+          const retry = await fetch(`${apiBase}/seats/${adminSeatId}/candidates`, {
+            signal: controller.signal,
+          });
+          const retryParsed = (await retry.json()) as Candidate[];
+          const retryNormalized = retryParsed.map((candidate) => ({
+            ...candidate,
+            id: (candidate as { _id?: string })._id ?? candidate.id,
+          }));
+          setAdminCandidates(retryNormalized);
+          setAdminVoteInputs(Object.fromEntries(retryNormalized.map((candidate) => [candidate.id, candidate.votes])));
+          return;
+        }
+        setAdminCandidates(normalized);
+        setAdminVoteInputs(Object.fromEntries(normalized.map((candidate) => [candidate.id, candidate.votes])));
+      } catch {
+        const localCandidates = seedCandidates.filter((candidate) => candidate.seatId === adminSeatId);
+        setAdminCandidates(localCandidates);
+        setAdminVoteInputs(
+          Object.fromEntries(localCandidates.map((candidate) => [candidate.id, candidate.votes]))
+        );
+      }
+    };
+    loadAdminCandidates();
+    return () => controller.abort();
+  }, [adminSeatId, adminDistrictId, apiBase]);
+
   const handleSelectDivision = (divisionId: string) => {
     setSelectedDivisionId(divisionId);
     setSelectedDistrictId(null);
     setSelectedSeatId(null);
+    setActivePage("dashboard");
+    if (location.pathname !== "/") {
+      navigate("/");
+    }
   };
 
   const handleSelectDistrict = (districtId: string) => {
     setSelectedDistrictId(districtId);
     setSelectedSeatId(null);
+    setActivePage("dashboard");
+    if (location.pathname !== "/") {
+      navigate("/");
+    }
+  };
+
+  const handleOpenSeat = (seatId: number) => {
+    setSelectedSeatId(seatId);
+    setActivePage("seat");
+    if (!location.pathname.startsWith("/admin")) {
+      navigate("/seat");
+    }
   };
 
   const handleGoogleSignIn = async () => {
@@ -676,31 +947,278 @@ function App() {
   };
 
   const districtsSource = isLiveData ? districtsLive : districts;
-  const filteredDistricts = selectedDivisionId
-    ? isLiveData
-      ? (() => {
-          const mapKey = divisionSvgIdMap[selectedDivisionId] ?? selectedDivisionId;
-          const labelKeys = divisionLabelKeys;
-          const fallbackKeys = (divisionDistrictKeys[mapKey] ?? []).map((name) =>
-            normalizeDistrictKey(name)
-          );
-          const allowedKeys = Array.from(new Set([...labelKeys, ...fallbackKeys]));
-          return districtsSource.filter((district) =>
-            allowedKeys.includes(normalizeDistrictKey(district.name))
-          );
-        })()
-      : districtsSource.filter((district) => district.divisionId === selectedDivisionId)
+  const filterDistrictsByDivision = (divisionId: string | null) => {
+    if (!divisionId) return [] as District[];
+    if (isLiveData) {
+      const mapKey = divisionSvgIdMap[divisionId] ?? divisionId;
+      const labelKeys = divisionLabelKeys;
+      const fallbackKeys = (divisionDistrictKeys[mapKey] ?? []).map((name) =>
+        normalizeDistrictKey(name)
+      );
+      const allowedKeys = Array.from(new Set([...labelKeys, ...fallbackKeys]));
+      return districtsSource.filter((district) =>
+        allowedKeys.includes(normalizeDistrictKey(district.name))
+      );
+    }
+    return districtsSource.filter((district) => district.divisionId === divisionId);
+  };
+  const filterAdminDistrictsByDivision = (divisionId: string | null) => {
+    if (!divisionId) return [] as District[];
+    if (!isLiveData) return districtsSource.filter((district) => district.divisionId === divisionId);
+    const mapKey = divisionSvgIdMap[divisionId] ?? divisionId;
+    const fallbackKeys = (divisionDistrictKeys[mapKey] ?? []).map((name) =>
+      normalizeDistrictKey(name)
+    );
+    if (fallbackKeys.length === 0) return districtsSource;
+    const allowedKeys = Array.from(new Set(fallbackKeys));
+    return districtsSource.filter((district) =>
+      allowedKeys.includes(normalizeDistrictKey(district.name))
+    );
+  };
+  const filterSeatsByDistrict = (districtId: string | null) =>
+    districtId
+      ? (isLiveData ? uiSeats : seats).filter((seat) => seat.districtId === districtId)
+      : [];
+
+  const filteredDistricts = filterDistrictsByDivision(selectedDivisionId);
+  const filteredSeats = filterSeatsByDistrict(selectedDistrictId);
+  const adminFilteredDistricts = filterAdminDistrictsByDivision(adminDivisionId);
+  const adminFilteredSeats = adminDistrictId
+    ? (isLiveData ? adminUiSeats : seats).filter((seat) => seat.districtId === adminDistrictId)
     : [];
-  const filteredSeats = selectedDistrictId
-    ? (isLiveData ? uiSeats : seats).filter((seat) => seat.districtId === selectedDistrictId)
-    : [];
-  const selectedSeatLeader = selectedSeatId ? leaders.get(selectedSeatId) : undefined;
+  const selectedSeatLeader = selectedSeatId ? leadersForMap.get(selectedSeatId) : undefined;
   const selectedSeatPartyColor =
     selectedSeatLeader?.partyId && selectedSeatLeader.partyId !== "NEUTRAL"
-      ? partyLookup.get(selectedSeatLeader.partyId)?.color
+      ? getWinnerColor(String(selectedSeatLeader.partyId)) ?? partyLookup.get(selectedSeatLeader.partyId)?.color
       : undefined;
   const liveMapActiveFill = selectedSeatPartyColor ?? "#22c55e";
   const isConfirmDisabled = !authUser || hasVotedWithGoogle || isSigningIn;
+
+  const adminTotalVotes = adminCandidates.reduce((acc, candidate) => acc + candidate.votes, 0);
+  const adminWinner = adminCandidates
+    .slice()
+    .sort((a, b) => b.votes - a.votes)[0];
+  const adminTotalVoters = adminFilteredSeats.find((seat) => seat.id === adminSeatId)?.totalVoters ?? 0;
+  const adminWinnerPercent = adminTotalVoters > 0
+    ? Math.round(((adminWinner?.votes ?? 0) / adminTotalVoters) * 100)
+    : 0;
+
+  const adminSection = (
+    <section className="grid gap-6">
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-200">Admin Panel</h2>
+            <p className="text-xs text-slate-400">Division → District → Seat → Candidate</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActivePage("dashboard")}
+            className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-slate-500"
+          >
+            Back to dashboard
+          </button>
+        </div>
+
+        <div className="mt-4 grid gap-4 md:grid-cols-3">
+          <label className="grid gap-2 text-xs text-slate-400">
+            Division
+            <select
+              value={adminDivisionId ?? ""}
+              onChange={(event) => {
+                const value = event.target.value || null;
+                setAdminDivisionId(value);
+                setAdminDistrictId(null);
+                setAdminSeatId(null);
+                setAdminCandidates([]);
+              }}
+              className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100"
+            >
+              <option value="">Select division</option>
+              {divisions.map((division) => (
+                <option key={division.id} value={division.id}>
+                  {division.name}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="grid gap-2 text-xs text-slate-400">
+            District
+            <select
+              value={adminDistrictId ?? ""}
+              onChange={(event) => {
+                const value = event.target.value || null;
+                setAdminDistrictId(value);
+                setAdminSeatId(null);
+                setAdminCandidates([]);
+              }}
+              className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100"
+              disabled={!adminDivisionId}
+            >
+              <option value="">Select district</option>
+              {adminFilteredDistricts.map((district) => (
+                <option key={district.id} value={district.id}>
+                  {district.name}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="grid gap-2 text-xs text-slate-400">
+            Seat
+            <select
+              value={adminSeatId ?? ""}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                setAdminSeatId(Number.isNaN(value) ? null : value);
+              }}
+              className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100"
+              disabled={!adminDistrictId}
+            >
+              <option value="">Select seat</option>
+              {adminFilteredSeats.map((seat) => (
+                <option key={seat.id} value={seat.id}>
+                  {seat.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {adminDistrictId && adminFilteredSeats.length === 0 && (
+          <p className="mt-3 text-xs text-slate-500">No seats found for this district.</p>
+        )}
+      </div>
+
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-200">Candidates</h3>
+            <p className="text-xs text-slate-400">Add votes for a specific seat</p>
+          </div>
+          {adminSeatId && (
+            <div className="text-right text-xs text-slate-400">
+              <div>Total votes: {formatVotes(adminTotalVotes)}</div>
+            </div>
+          )}
+        </div>
+        {adminSeatId && (
+          <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-5">
+            <div className="text-center text-xs uppercase tracking-wide text-slate-500">Winner</div>
+            <div className="mt-4 flex flex-wrap items-center justify-center gap-6">
+              <div className="flex items-center gap-3">
+                {adminWinner?.imageUrl ? (
+                  <img
+                    src={normalizeCandidateImage(adminWinner.imageUrl)}
+                    alt={adminWinner.name}
+                    referrerPolicy="no-referrer"
+                    loading="lazy"
+                    className="h-16 w-16 rounded-2xl object-cover"
+                  />
+                ) : (
+                  <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-slate-800 text-sm font-semibold text-slate-200">
+                    {adminWinner?.name
+                      ?.split(" ")
+                      .slice(0, 2)
+                      .map((chunk) => chunk[0])
+                      .join("") ?? "—"}
+                  </div>
+                )}
+              </div>
+              <div className="text-center">
+                <div className="text-2xl font-semibold text-slate-100">
+                  {adminWinner?.name ?? "—"}
+                </div>
+                <div className="mt-1 text-sm text-slate-400">
+                  {adminWinner?.partyLabel ?? (adminWinner ? partyLookup.get(adminWinner.partyId)?.name : "") ?? ""}
+                </div>
+                <div className="mt-2 text-xs text-slate-500">
+                  Total votes: {formatVotes(adminWinner?.votes ?? 0)}
+                </div>
+                <div className="mt-1 text-xs text-slate-500">
+                  Winner share: {adminWinnerPercent}% of {formatVotes(adminTotalVoters)} voters
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex h-16 w-16 items-center justify-center rounded-full border border-white bg-white text-lg shadow-sm ring-1 ring-slate-200">
+                  {adminWinner &&
+                  normalizeSymbolImage(
+                    adminWinner.symbolImageUrl ??
+                      getPartyLogoForLabel(
+                        adminWinner.partyLabel ?? partyLookup.get(adminWinner.partyId)?.name ?? ""
+                      )
+                  ) ? (
+                    <img
+                      src={normalizeSymbolImage(
+                        adminWinner.symbolImageUrl ??
+                          getPartyLogoForLabel(
+                            adminWinner.partyLabel ?? partyLookup.get(adminWinner.partyId)?.name ?? ""
+                          )
+                      )}
+                      alt={adminWinner.symbolLabel ?? adminWinner.symbol ?? "symbol"}
+                      referrerPolicy="no-referrer"
+                      loading="lazy"
+                      className="h-12 w-12 object-contain"
+                    />
+                  ) : (
+                    adminWinner?.symbolLabel ?? adminWinner?.symbol ?? "—"
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!adminSeatId && (
+          <p className="mt-4 text-xs text-slate-500">Select a seat to manage candidates.</p>
+        )}
+
+        {adminSeatId && (
+          <div className="mt-4 grid gap-3">
+            {adminCandidates.map((candidate) => (
+              <div
+                key={candidate.id}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3"
+              >
+                <div>
+                  <div className="text-sm font-semibold text-slate-100">{candidate.name}</div>
+                  <div className="text-xs text-slate-400">
+                    {candidate.partyLabel ?? partyLookup.get(candidate.partyId)?.name ?? "Unknown Party"}
+                  </div>
+                  <div className="mt-1 text-[11px] text-slate-500">Symbol: {candidate.symbolLabel ?? candidate.symbol}</div>
+                </div>
+                <div className="flex flex-1 flex-wrap items-center justify-between gap-4">
+                  <div className="flex-1 text-center">
+                    <div className="text-[10px] text-slate-500">Votes</div>
+                    <div className="text-lg font-semibold text-slate-100">{formatVotes(candidate.votes)}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAdminVoteModal({
+                        open: true,
+                        candidateId: candidate.id,
+                        value: adminVoteInputs[candidate.id] ?? candidate.votes,
+                      })
+                    }
+                    className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-slate-500"
+                  >
+                    Edit votes
+                  </button>
+                </div>
+              </div>
+            ))}
+            {adminCandidates.length === 0 && (
+              <div className="rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-xs text-slate-500">
+                No candidates found for this seat.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+    </section>
+  );
 
 
   const resultsSection = (
@@ -728,24 +1246,50 @@ function App() {
             src="/all_img/Bangladesh_election_2024.svg"
             interactivePaths
             baseFill="#ffffff"
+            labelFillMap={mapLabelFill}
             selectedPathId={selectedLiveMapPathId}
             onSelectPath={(pathId) => {
               setSelectedLiveMapPathId(pathId);
               setLiveUpdate("Live map selection updated.");
             }}
+            onHoverLabel={(label) => {
+              if (!label) {
+                setHoveredSeatId(null);
+                return;
+              }
+              const parsed = Number(label);
+              setHoveredSeatId(Number.isNaN(parsed) ? null : parsed);
+            }}
             hoverFill="#38bdf8"
             activeFill={liveMapActiveFill}
             className="h-[520px] w-full"
           />
+          <div className="absolute right-4 top-4 rounded-xl border border-slate-800 bg-slate-900/90 p-3 text-xs text-slate-200">
+            <div className="text-[10px] uppercase text-slate-500">Top 5 parties</div>
+            <div className="mt-2 space-y-1">
+              {topPartyLegend.map((item) => (
+                <div key={item.partyId} className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: item.party.color }} />
+                    <span className="text-[11px] text-slate-100">{item.party.name}</span>
+                  </div>
+                  <span className="text-[10px] text-slate-400">{item.seats}</span>
+                </div>
+              ))}
+            </div>
+          </div>
           <div className="absolute left-4 top-4 rounded-xl border border-slate-800 bg-slate-900/90 p-3 text-xs text-slate-300">
             <div className="text-[10px] uppercase text-slate-500">Hovered Seat</div>
             <div className="mt-1 text-sm font-semibold text-slate-100">
               {hoveredSeat?.name ?? "Hover a seat"}
             </div>
+            <div className="mt-1 text-[11px] text-slate-400">
+              Party: {hoveredPartyLabel ?? "—"}
+            </div>
             <div className="mt-1 flex items-center gap-2">
               <span
                 className="h-2 w-2 rounded-full"
-                style={{ backgroundColor: hoveredParty?.color ?? "#64748b" }}
+                style={{ backgroundColor: hoveredPartyColor ?? "#64748b" }}
               />
               <span>{hoveredLeader?.leaderName ?? "No leader yet"}</span>
             </div>
@@ -761,10 +1305,10 @@ function App() {
       <StatsBar partyRoster={snapshotRoster} stats={stats} totalSeats={totalSeats} />
       <SeatGrid
         seats={seatGrid}
-        leaders={leaders}
+        leaders={leadersForMap}
         partyLookup={partyLookup}
         selectedSeatId={selectedSeatId}
-        onSelect={(seatId) => setSelectedSeatId(seatId)}
+        onSelect={handleOpenSeat}
         onHover={setHoveredSeatId}
       />
       <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300">
@@ -785,17 +1329,6 @@ function App() {
           <div className="text-xs text-slate-400">
             Step {selectedSeatId ? 4 : selectedDistrictId ? 3 : selectedDivisionId ? 2 : 1}
           </div>
-        </div>
-        <div className="mt-4 overflow-hidden rounded-xl border border-slate-800 bg-slate-950">
-          <InteractiveSvgMap
-            src="/all_img/Proposed_Divisions_of_Bangladesh_(English).svg"
-            idMap={divisionSvgIdMap}
-            selectedId={selectedDivisionId}
-            onSelect={handleSelectDivision}
-            hoverFill="#38bdf8"
-            activeFill="#22c55e"
-            className="h-[380px] w-full"
-          />
         </div>
         <div className="mt-4 grid gap-4">
           <div>
@@ -857,7 +1390,7 @@ function App() {
                 <button
                   key={seat.id}
                   type="button"
-                  onClick={() => setSelectedSeatId(seat.id)}
+                  onClick={() => handleOpenSeat(seat.id)}
                   className={`rounded-xl border px-3 py-2 text-xs transition ${
                     selectedSeatId === seat.id
                       ? "border-violet-400 bg-violet-500/20 text-violet-200"
@@ -871,87 +1404,6 @@ function App() {
             </div>
           </div>
         </div>
-      </div>
-
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-sm font-semibold text-slate-200">Seat Details</h3>
-            <p className="text-xs text-slate-400">Candidates and vote action</p>
-          </div>
-          {selectedSeat && (
-            <div className="text-xs text-slate-400">
-              Turnout {turnoutPercent}% • {formatVotes(totalVotesInSeat)} votes
-            </div>
-          )}
-        </div>
-        {!selectedSeat && <p className="mt-4 text-xs text-slate-500">Select a seat to view candidates.</p>}
-        {selectedSeat && (
-          <>
-            <div className="mt-3 h-2 rounded-full bg-slate-800">
-              <div
-                className="h-2 rounded-full bg-emerald-500"
-                style={{ width: `${turnoutScale(turnoutPercent)}%` }}
-              />
-            </div>
-            <div className="mt-4 grid gap-3">
-              {candidatesInSeat.map((candidate) => {
-                const party = parties.find((item) => item.id === candidate.partyId);
-                const partyLabel = candidate.partyLabel ?? party?.name ?? "Unknown Party";
-                const symbolLabel = candidate.symbolLabel ?? candidate.symbol;
-                const initials = candidate.name
-                  .split(" ")
-                  .slice(0, 2)
-                  .map((chunk) => chunk[0])
-                  .join("");
-                const candidateImage = normalizeCandidateImage(candidate.imageUrl);
-                return (
-                  <div
-                    key={candidate.id}
-                    className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3"
-                  >
-                    <div className="flex items-center gap-3">
-                      {candidateImage ? (
-                        <img
-                          src={candidateImage}
-                          alt={candidate.name}
-                          referrerPolicy="no-referrer"
-                          loading="lazy"
-                          className="h-12 w-12 rounded-xl object-cover"
-                        />
-                      ) : (
-                        <div
-                          className="flex h-12 w-12 items-center justify-center rounded-xl text-xs font-semibold uppercase text-white"
-                          style={{ backgroundColor: party?.color ?? "#64748b" }}
-                        >
-                          {initials}
-                        </div>
-                      )}
-                      <div>
-                        <div className="text-sm font-semibold text-slate-100">{candidate.name}</div>
-                        <div className="text-xs text-slate-400">{partyLabel}</div>
-                        <div className="mt-1 inline-flex items-center gap-2 rounded-full border border-slate-800 bg-slate-900 px-2 py-0.5 text-[10px] text-slate-400">
-                          Symbol {symbolLabel}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-xs text-slate-400">Votes</div>
-                      <div className="text-sm font-semibold text-slate-100">{formatVotes(candidate.votes)}</div>
-                      <button
-                        type="button"
-                        onClick={() => handleOpenVote(candidate.id)}
-                        className="mt-2 rounded-full bg-emerald-500/20 px-3 py-1 text-xs text-emerald-200 hover:bg-emerald-500/30"
-                      >
-                        Vote
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
       </div>
     </section>
   );
@@ -968,35 +1420,62 @@ function App() {
           </div>
         </div>
       </header>
-      <div className="mx-auto w-full max-w-7xl px-6 pt-4">
-        <div className="flex items-center justify-center gap-2 rounded-full border border-slate-800 bg-slate-900/60 p-1">
-          <button
-            type="button"
-            onClick={() => setMobileView("results")}
-            className={`flex-1 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              mobileView === "results"
-                ? "bg-emerald-500/20 text-emerald-200"
-                : "text-slate-300 hover:text-slate-100"
-            }`}
-          >
-            Live result
-          </button>
-          <button
-            type="button"
-            onClick={() => setMobileView("vote")}
-            className={`flex-1 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              mobileView === "vote"
-                ? "bg-sky-500/20 text-sky-200"
-                : "text-slate-300 hover:text-slate-100"
-            }`}
-          >
-            Live voting
-          </button>
+      {activePage === "dashboard" && (
+        <div className="mx-auto w-full max-w-7xl px-6 pt-4">
+          <div className="flex items-center justify-center gap-2 rounded-full border border-slate-800 bg-slate-900/60 p-1">
+            <button
+              type="button"
+              onClick={() => setMobileView("results")}
+              className={`flex-1 rounded-full px-3 py-2 text-xs font-semibold transition ${
+                mobileView === "results"
+                  ? "bg-emerald-500/20 text-emerald-200"
+                  : "text-slate-300 hover:text-slate-100"
+              }`}
+            >
+              Live result
+            </button>
+            <button
+              type="button"
+              onClick={() => setMobileView("vote")}
+              className={`flex-1 rounded-full px-3 py-2 text-xs font-semibold transition ${
+                mobileView === "vote"
+                  ? "bg-sky-500/20 text-sky-200"
+                  : "text-slate-300 hover:text-slate-100"
+              }`}
+            >
+              Live voting
+            </button>
+          </div>
         </div>
-      </div>
+      )}
 
       <main className="mx-auto grid max-w-7xl gap-6 px-6 py-6">
-        {mobileView === "results" ? resultsSection : votingSection}
+        {activePage === "seat" ? (
+          selectedSeat ? (
+            <SeatCandidatesPage
+              seat={selectedSeat}
+              candidates={candidatesInSeat}
+              partyLookup={partyLookup}
+              partyRoster={snapshotRoster}
+              totalVotes={totalVotesInSeat}
+              turnoutPercent={turnoutPercent}
+              onBack={() => {
+                setActivePage("dashboard");
+                navigate("/");
+              }}
+            />
+          ) : (
+            <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 text-sm text-slate-400">
+              Select a seat to view candidates.
+            </div>
+          )
+        ) : activePage === "admin" ? (
+          adminSection
+        ) : mobileView === "results" ? (
+          resultsSection
+        ) : (
+          votingSection
+        )}
       </main>
 
       {partyModal.open && (
@@ -1093,6 +1572,84 @@ function App() {
                 }`}
               >
                 Confirm Vote
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {adminVoteModal.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-6">
+          <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6">
+            <h3 className="text-lg font-semibold text-slate-100">Edit votes</h3>
+            <p className="mt-1 text-xs text-slate-400">Set the total votes for this candidate.</p>
+            <div className="mt-4 grid gap-2">
+              <label className="text-xs text-slate-400">Votes</label>
+              <input
+                type="number"
+                min={0}
+                value={adminVoteModal.value}
+                onChange={(event) =>
+                  setAdminVoteModal((current) => ({
+                    ...current,
+                    value: Math.max(0, Number(event.target.value || 0)),
+                  }))
+                }
+                className="w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100"
+              />
+            </div>
+            <div className="mt-6 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setAdminVoteModal({ open: false, candidateId: null, value: 0 })}
+                className="rounded-full border border-slate-700 px-4 py-2 text-xs text-slate-300 hover:border-slate-500"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!adminVoteModal.candidateId) return;
+                  const nextValue = Math.max(0, adminVoteModal.value);
+                  const seatId = adminSeatId;
+                  if (!seatId) return;
+                  setAdminVoteSaving(true);
+                  fetch(`${apiBase}/seats/${seatId}/candidates/${adminVoteModal.candidateId}/votes`, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ votes: nextValue }),
+                  })
+                    .then(async (response) => {
+                      if (!response.ok) throw new Error("Failed to update votes");
+                      const payload = (await response.json()) as { candidate: Candidate };
+                      setAdminVoteInputs((current) => ({
+                        ...current,
+                        [adminVoteModal.candidateId as string]: payload.candidate.votes,
+                      }));
+                      setAdminCandidates((current) =>
+                        current.map((item) =>
+                          item.id === adminVoteModal.candidateId ? { ...item, votes: payload.candidate.votes } : item
+                        )
+                      );
+                      setCandidates((current) =>
+                        current.map((item) =>
+                          item.id === adminVoteModal.candidateId ? { ...item, votes: payload.candidate.votes } : item
+                        )
+                      );
+                      setAdminVoteModal({ open: false, candidateId: null, value: 0 });
+                    })
+                    .catch(() => {
+                      setAdminVoteModal({ open: false, candidateId: null, value: 0 });
+                    })
+                    .finally(() => setAdminVoteSaving(false));
+                }}
+                disabled={adminVoteSaving}
+                className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
+                  adminVoteSaving
+                    ? "cursor-not-allowed bg-slate-700 text-slate-400"
+                    : "bg-emerald-500 text-slate-950 hover:bg-emerald-400"
+                }`}
+              >
+                {adminVoteSaving ? "Saving..." : "Confirm"}
               </button>
             </div>
           </div>
